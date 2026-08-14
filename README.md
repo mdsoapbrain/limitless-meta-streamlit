@@ -2,7 +2,7 @@
 
 An unofficial, read-only Streamlit dashboard for descriptive analysis of public
 Limitless Tournament Platform data. The deployed snapshot includes Standard,
-online PTCGL tournaments from 2026-07-01 through 2026-08-13 with at least 60
+online PTCGL tournaments from 2026-07-01 through 2026-08-14 with at least 60
 players.
 
 ## Run locally
@@ -16,6 +16,13 @@ python3.11 -m venv .venv
 .venv/bin/python scripts/verify_deploy.py
 .venv/bin/python -m pytest -q
 .venv/bin/streamlit run dashboard/app.py
+```
+
+Production hides internal debug controls and detailed exception messages. To
+enable the tournament-audit debug toggle during trusted local development, run:
+
+```bash
+LIMITLESS_ENABLE_DEBUG=1 .venv/bin/streamlit run dashboard/app.py
 ```
 
 ## Deploy to Streamlit Community Cloud

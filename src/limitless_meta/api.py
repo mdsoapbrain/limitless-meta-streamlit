@@ -18,6 +18,7 @@ class LimitlessAPIError(RuntimeError):
 
 class LimitlessAPI:
     BASE_URL = "https://play.limitlesstcg.com/api"
+    TOURNAMENT_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
     def __init__(
         self,
@@ -134,6 +135,7 @@ class LimitlessAPI:
     def tournament_details(
         self, tournament_id: str, *, force_refresh: bool = False
     ) -> dict[str, Any]:
+        tournament_id = self._validated_tournament_id(tournament_id)
         payload = self.get_json(
             f"/tournaments/{tournament_id}/details",
             params=None,
@@ -147,6 +149,7 @@ class LimitlessAPI:
     def tournament_standings(
         self, tournament_id: str, *, force_refresh: bool = False
     ) -> list[dict[str, Any]]:
+        tournament_id = self._validated_tournament_id(tournament_id)
         payload = self.get_json(
             f"/tournaments/{tournament_id}/standings",
             params=None,
@@ -160,6 +163,7 @@ class LimitlessAPI:
     def tournament_pairings(
         self, tournament_id: str, *, force_refresh: bool = False
     ) -> list[dict[str, Any]]:
+        tournament_id = self._validated_tournament_id(tournament_id)
         payload = self.get_json(
             f"/tournaments/{tournament_id}/pairings",
             params=None,
@@ -179,9 +183,17 @@ class LimitlessAPI:
         if self.progress is not None:
             self.progress(message)
 
+    @classmethod
+    def _validated_tournament_id(cls, tournament_id: str) -> str:
+        value = str(tournament_id)
+        if not cls.TOURNAMENT_ID_PATTERN.fullmatch(value):
+            raise LimitlessAPIError(f"Invalid tournament ID: {value!r}")
+        return value
+
     @staticmethod
     def _backoff(attempt: int) -> float:
-        return min(30.0, (2**attempt) + random.uniform(0.0, 0.5))
+        # This randomness is retry jitter, not a security or cryptographic value.
+        return min(30.0, (2**attempt) + random.uniform(0.0, 0.5))  # nosec B311
 
     def _retry_delay(self, response: requests.Response, attempt: int) -> float:
         retry_after = response.headers.get("Retry-After")

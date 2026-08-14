@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from datetime import timedelta
 from pathlib import Path
@@ -15,7 +16,7 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from limitless_meta.database import read_tables  # noqa: E402
+from limitless_meta.database import read_decklists_for_deck, read_tables  # noqa: E402
 from limitless_meta.metrics import (  # noqa: E402
     compute_deck_period_series,
     compute_metrics,
@@ -23,6 +24,7 @@ from limitless_meta.metrics import (  # noqa: E402
     select_representative_decklists,
 )
 from limitless_meta.models import UNKNOWN_DECK_ID  # noqa: E402
+from limitless_meta.security import dataframe_to_safe_csv_bytes, escape_markdown  # noqa: E402
 
 
 DATABASE_PATH = PROJECT_ROOT / "data" / "meta.duckdb"
@@ -31,6 +33,11 @@ LOW_SAMPLE_N = 20
 LOW_BLUE = "#3f7cac"
 HIGH_RED = "#d26a5c"
 NEUTRAL_GRAY = "#f3f4f6"
+DEBUG_ENABLED = os.getenv("LIMITLESS_ENABLE_DEBUG", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+}
 
 
 st.set_page_config(page_title="Limitless PTCGL Meta Analyzer", page_icon="⚡", layout="wide")
@@ -52,10 +59,17 @@ def load_data(database_mtime: float) -> dict[str, pd.DataFrame]:
             "matches",
             "tournament_audit",
             "topcut_diagnostics",
-            "decklists",
             "run_metadata",
         ],
     )
+
+
+@st.cache_data(show_spinner=False)
+def load_decklists(
+    database_mtime: float, deck_id: str, tournament_ids: tuple[str, ...]
+) -> pd.DataFrame:
+    del database_mtime
+    return read_decklists_for_deck(DATABASE_PATH, deck_id, tournament_ids)
 
 
 def representation_chart(summary: pd.DataFrame, limit: int = 15) -> alt.Chart:
@@ -171,7 +185,6 @@ if not DATABASE_PATH.exists():
 data = load_data(DATABASE_PATH.stat().st_mtime)
 tournaments = data["tournaments"].copy()
 entries = data["entries"].copy()
-decklists = data["decklists"].copy()
 matches = data["matches"].copy()
 if tournaments.empty:
     st.warning("The database contains no eligible tournaments for its last analysis window.")
@@ -216,7 +229,7 @@ with st.sidebar:
     match_scope = "all" if match_scope_label == "All" else "swiss"
     minimum_n = st.number_input("Minimum matchup N", min_value=0, value=10, step=1)
     hide_unknown = st.checkbox("Hide UNKNOWN decks", value=True)
-    debug_mode = st.checkbox("Debug mode", value=False)
+    debug_mode = st.checkbox("Debug mode", value=False) if DEBUG_ENABLED else False
 
 if selected_start > selected_end:
     st.error("Start date must be on or before end date.")
@@ -346,7 +359,7 @@ with tabs[0]:
     )
     st.download_button(
         "Export global summary",
-        global_table.to_csv(index=False).encode("utf-8"),
+        dataframe_to_safe_csv_bytes(global_table),
         file_name="deck_summary_filtered.csv",
         mime="text/csv",
     )
@@ -374,10 +387,15 @@ with tabs[1]:
     )
 
     st.subheader("Representative decklists")
+    selected_decklists = load_decklists(
+        DATABASE_PATH.stat().st_mtime,
+        selected_id,
+        tuple(sorted(included_ids)),
+    )
     representative_lists = select_representative_decklists(
         filtered_tournaments,
         filtered_entries,
-        decklists,
+        selected_decklists,
         deck_id=selected_id,
         limit=3,
     )
@@ -404,12 +422,14 @@ with tabs[1]:
             with list_tab:
                 detail_column, link_column = st.columns([4, 2])
                 with detail_column:
-                    st.markdown(f"**{row.tournament_name}**")
+                    st.markdown(f"**{escape_markdown(row.tournament_name)}**")
                     placing = f"#{int(row.placing)}" if pd.notna(row.placing) else "Unplaced"
                     st.caption(
-                        f"{row.tournament_date} · {int(row.players):,} players · "
-                        f"{row.player_name} · {placing} · "
-                        f"{int(row.wins)}-{int(row.losses)}-{int(row.ties)}"
+                        escape_markdown(
+                            f"{row.tournament_date} · {int(row.players):,} players · "
+                            f"{row.player_name} · {placing} · "
+                            f"{int(row.wins)}-{int(row.losses)}-{int(row.ties)}"
+                        )
                     )
                 with link_column:
                     st.link_button(
@@ -532,7 +552,7 @@ with tabs[1]:
     )
     st.download_button(
         "Export selected matchups",
-        table.to_csv(index=False).encode("utf-8"),
+        dataframe_to_safe_csv_bytes(table),
         file_name=f"{selected_id}_matchups.csv",
         mime="text/csv",
     )
@@ -766,7 +786,7 @@ with tabs[4]:
     st.dataframe(match_detail[match_columns], width="stretch", hide_index=True)
     st.download_button(
         "Export tournament pairings",
-        match_detail[match_columns].to_csv(index=False).encode("utf-8"),
+        dataframe_to_safe_csv_bytes(match_detail[match_columns]),
         file_name=f"{event_id}_pairings.csv",
         mime="text/csv",
     )
@@ -785,7 +805,7 @@ with tabs[5]:
     st.dataframe(visible_audit[audit_columns], width="stretch", hide_index=True)
     st.download_button(
         "Export tournament audit",
-        visible_audit.to_csv(index=False).encode("utf-8"),
+        dataframe_to_safe_csv_bytes(visible_audit),
         file_name="tournament_audit_filtered.csv",
         mime="text/csv",
     )

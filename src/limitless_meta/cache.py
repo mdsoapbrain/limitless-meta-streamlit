@@ -14,10 +14,19 @@ class JsonCache:
     """A transparent on-disk cache that keeps raw API bodies audit-friendly."""
 
     def __init__(self, root: Path):
-        self.root = Path(root)
+        self.root = Path(root).resolve()
 
     def path(self, relative: str | Path) -> Path:
-        return self.root / relative
+        relative_path = Path(relative)
+        if relative_path.is_absolute() or ".." in relative_path.parts:
+            raise ValueError(f"Cache path must stay below {self.root}: {relative}")
+        target = (self.root / relative_path).resolve()
+        if target != self.root and self.root not in target.parents:
+            raise ValueError(f"Cache path must stay below {self.root}: {relative}")
+        return target
+
+    def metadata_path(self, relative: str | Path) -> Path:
+        return self.path(Path("_metadata") / Path(relative))
 
     def exists(self, relative: str | Path) -> bool:
         return self.path(relative).is_file()
@@ -32,7 +41,7 @@ class JsonCache:
         target = self.path(relative)
         if not target.is_file():
             return None
-        metadata_target = self.root / "_metadata" / Path(relative)
+        metadata_target = self.metadata_path(relative)
         if metadata_target.is_file():
             try:
                 metadata = json.loads(metadata_target.read_text(encoding="utf-8"))
@@ -58,7 +67,7 @@ class JsonCache:
         target.parent.mkdir(parents=True, exist_ok=True)
         self._atomic_json(target, payload)
 
-        metadata_target = self.root / "_metadata" / Path(relative)
+        metadata_target = self.metadata_path(relative)
         metadata = {
             "fetched_at": utc_now_iso(),
             "url": url,

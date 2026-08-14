@@ -1,8 +1,15 @@
 [browser]
 gatherUsageStats = false
 
+[client]
+showErrorDetails = "none"
+toolbarMode = "viewer"
+
 [server]
 headless = true
+enableCORS = true
+enableXsrfProtection = true
+enableStaticServing = false
 
 [theme]
 primaryColor = "#d26a5c"

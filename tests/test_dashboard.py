@@ -12,3 +12,4 @@ def test_dashboard_starts_against_generated_database() -> None:
     app.run()
     assert not app.exception
     assert app.title[0].value == "Limitless PTCGL Online Tournament Meta Analyzer"
+    assert all(checkbox.label != "Debug mode" for checkbox in app.checkbox)

@@ -175,7 +175,8 @@ def write_database(path: Path, tables: dict[str, pd.DataFrame]) -> None:
                 connection.register(view_name, frame)
                 columns = ", ".join(f'"{column}"' for column in _column_names(table_name))
                 connection.execute(
-                    f'INSERT INTO "{table_name}" ({columns}) SELECT {columns} FROM "{view_name}"'
+                    # Identifiers come exclusively from the static TABLE_SCHEMAS allowlist.
+                    f'INSERT INTO "{table_name}" ({columns}) SELECT {columns} FROM "{view_name}"'  # nosec B608
                 )
                 connection.unregister(view_name)
         connection.execute("COMMIT")
@@ -189,19 +190,52 @@ def write_database(path: Path, tables: dict[str, pd.DataFrame]) -> None:
 def read_table(path: Path, table_name: str) -> pd.DataFrame:
     if table_name not in TABLE_SCHEMAS:
         raise KeyError(f"Unknown table: {table_name}")
+    # table_name was validated against TABLE_SCHEMAS above.
+    query = f'SELECT * FROM "{table_name}"'  # nosec B608
     connection = duckdb.connect(str(path), read_only=True)
     try:
-        return connection.execute(f'SELECT * FROM "{table_name}"').fetchdf()
+        return connection.execute(query).fetchdf()
     finally:
         connection.close()
 
 
 def read_tables(path: Path, names: Iterable[str]) -> dict[str, pd.DataFrame]:
+    requested_names = list(names)
+    unknown_names = [name for name in requested_names if name not in TABLE_SCHEMAS]
+    if unknown_names:
+        raise KeyError(f"Unknown table(s): {', '.join(unknown_names)}")
     connection = duckdb.connect(str(path), read_only=True)
     try:
         return {
-            name: connection.execute(f'SELECT * FROM "{name}"').fetchdf()
-            for name in names
+            # Every name was validated against TABLE_SCHEMAS before connecting.
+            name: connection.execute(f'SELECT * FROM "{name}"').fetchdf()  # nosec B608
+            for name in requested_names
         }
+    finally:
+        connection.close()
+
+
+def read_decklists_for_deck(
+    path: Path, deck_id: str, tournament_ids: Iterable[str]
+) -> pd.DataFrame:
+    selected_ids = list(dict.fromkeys(str(value) for value in tournament_ids))
+    columns = ["tournament_id", "player_id", "player_name", "decklist_json"]
+    if not selected_ids:
+        return pd.DataFrame(columns=columns)
+
+    placeholders = ", ".join("?" for _ in selected_ids)
+    # Only the number of parameter placeholders is interpolated; all values are bound.
+    query = f"""
+        SELECT d.tournament_id, d.player_id, d.player_name, d.decklist_json
+        FROM decklists AS d
+        INNER JOIN entries AS e
+            ON e.tournament_id = d.tournament_id
+            AND e.player_id = d.player_id
+        WHERE e.deck_id = ?
+          AND d.tournament_id IN ({placeholders})
+    """  # nosec B608
+    connection = duckdb.connect(str(path), read_only=True)
+    try:
+        return connection.execute(query, [str(deck_id), *selected_ids]).fetchdf()
     finally:
         connection.close()
