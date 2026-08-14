@@ -48,8 +48,16 @@ Run the bundled updater locally with the new inclusive end date:
 ```
 
 The script runs both `fetch` and `analyze`, reuses the local raw cache, rebuilds
-`data/meta.duckdb`, and validates the result. After reviewing the dashboard,
-publish the new snapshot:
+`data/meta.duckdb`, and validates the result.
+
+To keep only a rolling window, provide an optional start date as the second
+argument:
+
+```bash
+./scripts/update_data.sh END_DATE START_DATE
+```
+
+After reviewing the dashboard, publish the new snapshot:
 
 ```bash
 git add data/meta.duckdb
