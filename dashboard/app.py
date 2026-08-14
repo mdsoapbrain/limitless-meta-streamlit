@@ -26,6 +26,7 @@ from limitless_meta.models import UNKNOWN_DECK_ID  # noqa: E402
 
 
 DATABASE_PATH = PROJECT_ROOT / "data" / "meta.duckdb"
+SUPPORT_URL = "https://buymeacoffee.com/qmi0000011"
 LOW_SAMPLE_N = 20
 LOW_BLUE = "#3f7cac"
 HIGH_RED = "#d26a5c"
@@ -193,6 +194,14 @@ st.caption(
 
 with st.sidebar:
     st.header("Observed window")
+    st.link_button(
+        "☕ Buy me a coffee",
+        SUPPORT_URL,
+        type="primary",
+        width="stretch",
+    )
+    st.caption("Support future dashboard updates.")
+    st.divider()
     preset = st.selectbox(
         "Time window", ["Custom", "Last 7 days", "Last 14 days", "Last 30 days", "Last 60 days"]
     )

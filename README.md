@@ -29,7 +29,8 @@ python3.11 -m venv .venv
 5. Deploy. No secrets are required for this read-only snapshot.
 
 The dashboard reads only the bundled DuckDB file. It does not call the
-Limitless API when a visitor opens the app.
+Limitless API when a visitor opens the app. Its sidebar includes an optional
+[Buy Me a Coffee](https://buymeacoffee.com/qmi0000011) support link.
 
 ## Refresh the data snapshot
 
