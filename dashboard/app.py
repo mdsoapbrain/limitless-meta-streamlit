@@ -31,7 +31,6 @@ LOW_SAMPLE_N = 20
 LOW_BLUE = "#3f7cac"
 HIGH_RED = "#d26a5c"
 NEUTRAL_GRAY = "#f3f4f6"
-ACCENT_CYAN = "#00A0C8"
 
 
 st.set_page_config(page_title="Limitless PTCGL Meta Analyzer", page_icon="⚡", layout="wide")
@@ -64,7 +63,7 @@ def representation_chart(summary: pd.DataFrame, limit: int = 15) -> alt.Chart:
     source["representation_label"] = source["representation"].map(lambda value: f"{value:.1%}")
     bars = (
         alt.Chart(source)
-        .mark_bar(color=ACCENT_CYAN)
+        .mark_bar()
         .encode(
             x=alt.X("representation:Q", title="Observed representation", axis=alt.Axis(format=".0%")),
             y=alt.Y("deck_name:N", title=None, sort="-x"),
@@ -121,7 +120,7 @@ def impact_chart(selected_matchups: pd.DataFrame, limit: int = 15) -> alt.Chart:
 def trend_chart(source: pd.DataFrame, column: str, title: str) -> alt.Chart:
     return (
         alt.Chart(source)
-        .mark_line(point=True, color=ACCENT_CYAN)
+        .mark_line(point=True)
         .encode(
             x=alt.X("period_start:T", title=None),
             y=alt.Y(f"{column}:Q", title=title, axis=alt.Axis(format=".0%")),
@@ -271,14 +270,14 @@ with st.sidebar:
             padding: 0.65rem 1rem;
             border: 1px solid rgba(235, 238, 238, 0.28);
             border-radius: 0.5rem;
-            background: #00A0C8;
-            color: #002147 !important;
+            background: #d26a5c;
+            color: #ffffff !important;
             font-weight: 600;
             text-decoration: none !important;
             box-shadow: 0 0.2rem 0.6rem rgba(0, 0, 0, 0.22);
         }}
         .bmc-sidebar-link:hover {{
-            background: #35B6D5;
+            background: #df7a6d;
         }}
         @media (max-width: 767px) {{
             .bmc-sidebar-link {{
