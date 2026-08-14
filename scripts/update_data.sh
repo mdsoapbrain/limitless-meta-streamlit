@@ -42,18 +42,22 @@ fi
 
 cd "$PROJECT_DIR"
 
-"$PYTHON_BIN" -m limitless_meta fetch \
+run_python() {
+  PYTHONPATH="$PROJECT_DIR/src${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON_BIN" "$@"
+}
+
+run_python -m limitless_meta fetch \
   --start "$START_DATE" \
   --end "$END_DATE" \
   --min-players 60
 
-"$PYTHON_BIN" -m limitless_meta analyze \
+run_python -m limitless_meta analyze \
   --start "$START_DATE" \
   --end "$END_DATE" \
   --min-players 60 \
   --match-scope all
 
-"$PYTHON_BIN" scripts/verify_deploy.py
+run_python scripts/verify_deploy.py
 
 echo
 echo "Snapshot updated for $START_DATE through $END_DATE."
