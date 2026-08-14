@@ -31,6 +31,7 @@ LOW_SAMPLE_N = 20
 LOW_BLUE = "#3f7cac"
 HIGH_RED = "#d26a5c"
 NEUTRAL_GRAY = "#f3f4f6"
+ACCENT_CYAN = "#00A0C8"
 
 
 st.set_page_config(page_title="Limitless PTCGL Meta Analyzer", page_icon="⚡", layout="wide")
@@ -63,7 +64,7 @@ def representation_chart(summary: pd.DataFrame, limit: int = 15) -> alt.Chart:
     source["representation_label"] = source["representation"].map(lambda value: f"{value:.1%}")
     bars = (
         alt.Chart(source)
-        .mark_bar()
+        .mark_bar(color=ACCENT_CYAN)
         .encode(
             x=alt.X("representation:Q", title="Observed representation", axis=alt.Axis(format=".0%")),
             y=alt.Y("deck_name:N", title=None, sort="-x"),
@@ -120,7 +121,7 @@ def impact_chart(selected_matchups: pd.DataFrame, limit: int = 15) -> alt.Chart:
 def trend_chart(source: pd.DataFrame, column: str, title: str) -> alt.Chart:
     return (
         alt.Chart(source)
-        .mark_line(point=True)
+        .mark_line(point=True, color=ACCENT_CYAN)
         .encode(
             x=alt.X("period_start:T", title=None),
             y=alt.Y(f"{column}:Q", title=title, axis=alt.Axis(format=".0%")),
@@ -194,14 +195,6 @@ st.caption(
 
 with st.sidebar:
     st.header("Observed window")
-    st.link_button(
-        "☕ Buy me a coffee",
-        SUPPORT_URL,
-        type="primary",
-        width="stretch",
-    )
-    st.caption("Support future dashboard updates.")
-    st.divider()
     preset = st.selectbox(
         "Time window", ["Custom", "Last 7 days", "Last 14 days", "Last 30 days", "Last 60 days"]
     )
@@ -257,6 +250,47 @@ label_to_id = {
 with st.sidebar:
     st.divider()
     selected_label = st.selectbox("Deck", list(label_to_id))
+    st.markdown(
+        f"""
+        <a class="bmc-sidebar-link" href="{SUPPORT_URL}" target="_blank"
+           rel="noopener noreferrer">☕ Buy me a coffee</a>
+        <style>
+        section[data-testid="stSidebar"] div[data-testid="stSidebarUserContent"] {{
+            padding-bottom: 5rem;
+        }}
+        .bmc-sidebar-link {{
+            position: fixed;
+            left: 1.25rem;
+            bottom: 1rem;
+            z-index: 9999;
+            width: 16rem;
+            box-sizing: border-box;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 0.65rem 1rem;
+            border: 1px solid rgba(235, 238, 238, 0.28);
+            border-radius: 0.5rem;
+            background: #00A0C8;
+            color: #002147 !important;
+            font-weight: 600;
+            text-decoration: none !important;
+            box-shadow: 0 0.2rem 0.6rem rgba(0, 0, 0, 0.22);
+        }}
+        .bmc-sidebar-link:hover {{
+            background: #35B6D5;
+        }}
+        @media (max-width: 767px) {{
+            .bmc-sidebar-link {{
+                position: static;
+                width: 100%;
+                margin-top: 1rem;
+            }}
+        }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 selected_id = label_to_id[selected_label]
 selected = deck_summary[deck_summary["deck_id"] == selected_id].iloc[0]
 

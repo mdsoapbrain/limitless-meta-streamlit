@@ -20,13 +20,20 @@ python3.11 -m venv .venv
 
 ## Deploy to Streamlit Community Cloud
 
-1. Push this directory to a GitHub repository. The included
+1. Create an empty GitHub repository, then connect and push this local repository:
+
+   ```bash
+   git remote add origin https://github.com/YOUR_USERNAME/limitless-meta-streamlit.git
+   git push -u origin main
+   ```
+
+2. The included
    `data/meta.duckdb` file must remain tracked; Git LFS is recommended for
    future database versions.
-2. In Streamlit Community Cloud, create an app from the repository.
-3. Set the entrypoint to `dashboard/app.py`.
-4. Open Advanced settings and select Python 3.11.
-5. Deploy. No secrets are required for this read-only snapshot.
+3. In Streamlit Community Cloud, create an app from the repository.
+4. Set the branch to `main` and the entrypoint to `dashboard/app.py`.
+5. Open Advanced settings and select Python 3.11.
+6. Deploy. No secrets are required for this read-only snapshot.
 
 The dashboard reads only the bundled DuckDB file. It does not call the
 Limitless API when a visitor opens the app. Its sidebar includes an optional
@@ -34,18 +41,23 @@ Limitless API when a visitor opens the app. Its sidebar includes an optional
 
 ## Refresh the data snapshot
 
-Run the analysis pipeline outside Streamlit Community Cloud, verify the new
-database, then commit the updated `data/meta.duckdb` file:
+Run the bundled updater locally with the new inclusive end date:
 
 ```bash
-.venv/bin/python -m limitless_meta analyze \
-  --start 2026-07-01 \
-  --end YYYY-MM-DD \
-  --min-players 60 \
-  --match-scope all
-
-.venv/bin/python scripts/verify_deploy.py
+./scripts/update_data.sh YYYY-MM-DD
 ```
+
+The script runs both `fetch` and `analyze`, reuses the local raw cache, rebuilds
+`data/meta.duckdb`, and validates the result. After reviewing the dashboard,
+publish the new snapshot:
+
+```bash
+git add data/meta.duckdb
+git commit -m "Update data through YYYY-MM-DD"
+git push
+```
+
+Streamlit Community Cloud detects the GitHub update and redeploys the app.
 
 Raw API cache and CSV analytics are intentionally excluded from the deployment
 repository. Community Cloud local storage is not used as persistent storage.
