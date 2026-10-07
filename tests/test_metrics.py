@@ -5,6 +5,7 @@ import math
 import pandas as pd
 
 from limitless_meta.metrics import (
+    compute_cohort_metrics,
     compute_deck_period_series,
     compute_metrics,
     select_representative_decklists,
@@ -92,6 +93,57 @@ def test_ties_are_retained_but_excluded_from_n_and_raw_wr() -> None:
     assert row.raw_win_rate == 1.0
 
 
+def test_cohort_metrics_keep_opponents_but_only_count_focus_perspective() -> None:
+    entries = pd.DataFrame(
+        [
+            {
+                "tournament_id": "t1", "player_id": "pro", "deck_id": "A",
+                "deck_name": "Deck A", "top_cut": True,
+                "wins": 3, "losses": 2, "ties": 1,
+            },
+            {
+                "tournament_id": "t1", "player_id": "field_b", "deck_id": "B",
+                "deck_name": "Deck B", "top_cut": False,
+                "wins": 0, "losses": 0, "ties": 0,
+            },
+            {
+                "tournament_id": "t1", "player_id": "field_c", "deck_id": "C",
+                "deck_name": "Deck C", "top_cut": False,
+                "wins": 0, "losses": 0, "ties": 0,
+            },
+        ]
+    )
+    matches = pd.DataFrame(
+        [
+            _match(1, "pro", "field_b", "A_WIN"),
+            _match(2, "field_c", "pro", "A_WIN"),
+            _match(3, "field_b", "field_c", "A_WIN"),
+        ]
+    )
+
+    summary, matchups = compute_cohort_metrics(
+        pd.DataFrame([{"tournament_id": "t1"}]),
+        entries,
+        matches,
+        focus_player_ids={"pro"},
+    )
+
+    assert summary["deck_id"].tolist() == ["A"]
+    deck_a = summary.iloc[0]
+    assert deck_a.entries == 1
+    assert deck_a.representation == 1.0
+    assert deck_a.wins == 3
+    assert deck_a.losses == 2
+    assert deck_a.ties == 1
+    assert deck_a.top_cut_rate == 1.0
+    a_vs_b = matchups[(matchups.deck_a == "A") & (matchups.deck_b == "B")].iloc[0]
+    a_vs_c = matchups[(matchups.deck_a == "A") & (matchups.deck_b == "C")].iloc[0]
+    assert a_vs_b.raw_win_rate == 1.0
+    assert a_vs_c.raw_win_rate == 0.0
+    assert a_vs_b.opponent_representation == 1 / 3
+    assert matchups["all_matches"].sum() == 2
+
+
 def test_top_cut_denominator_excludes_swiss_only_tournament_entries() -> None:
     rows = []
     for index in range(12):
@@ -160,6 +212,37 @@ def test_period_series_uses_independent_observed_denominators() -> None:
         match_scope="all",
     )
     assert series["representation"].tolist() == [0.5, 0.25]
+
+
+def test_cohort_period_series_uses_cohort_entry_denominator() -> None:
+    tournaments = pd.DataFrame(
+        [
+            {"tournament_id": "w1", "date": "2026-08-01", "players": 2},
+            {"tournament_id": "w2", "date": "2026-08-08", "players": 3},
+        ]
+    )
+    entries = pd.DataFrame(
+        [
+            {"tournament_id": "w1", "player_id": "pro", "deck_id": "A", "deck_name": "A", "top_cut": None},
+            {"tournament_id": "w1", "player_id": "other1", "deck_id": "B", "deck_name": "B", "top_cut": None},
+            {"tournament_id": "w2", "player_id": "pro", "deck_id": "A", "deck_name": "A", "top_cut": None},
+            {"tournament_id": "w2", "player_id": "other2", "deck_id": "B", "deck_name": "B", "top_cut": None},
+            {"tournament_id": "w2", "player_id": "other3", "deck_id": "C", "deck_name": "C", "top_cut": None},
+        ]
+    )
+    series = compute_deck_period_series(
+        tournaments,
+        entries,
+        pd.DataFrame(),
+        deck_id="A",
+        start_date=pd.Timestamp("2026-08-01").date(),
+        end_date=pd.Timestamp("2026-08-14").date(),
+        minimum_players=0,
+        match_scope="all",
+        focus_player_ids={"pro"},
+    )
+    assert series["representation"].tolist() == [1.0, 1.0]
+    assert series["eligible_entries"].tolist() == [1, 1]
 
 
 def test_representative_decklists_pick_best_entry_then_largest_events() -> None:

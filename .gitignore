@@ -3,6 +3,7 @@
 .pytest_cache/
 __pycache__/
 *.py[cod]
+*.egg-info/
 *.duckdb.wal
 
 # The deployable read-only database is intentionally committed.

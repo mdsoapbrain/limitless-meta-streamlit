@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from itertools import product
 from datetime import date, timedelta
-from typing import Any
+from typing import Any, Collection
 
 import pandas as pd
 
@@ -128,6 +128,239 @@ def _directional_records(
         records.append({"deck_a": deck_a, "deck_b": deck_b, **first})
         records.append({"deck_a": deck_b, "deck_b": deck_a, **second})
     return pd.DataFrame(records, columns=columns)
+
+
+def _cohort_directional_records(
+    entries: pd.DataFrame,
+    matches: pd.DataFrame,
+    focus_player_ids: set[str],
+    match_scope: str,
+) -> pd.DataFrame:
+    """Return match records from the selected players' perspective only."""
+    columns = [
+        "deck_a",
+        "deck_b",
+        "wins",
+        "losses",
+        "ties",
+        "double_losses",
+        "all_matches",
+    ]
+    if entries.empty or matches.empty or not focus_player_ids:
+        return pd.DataFrame(columns=columns)
+    if match_scope not in {"all", "swiss"}:
+        raise ValueError("match_scope must be 'all' or 'swiss'")
+
+    scoped = matches
+    if match_scope == "swiss":
+        scoped = matches[matches["phase_type"].astype(str).str.upper() == "SWISS"]
+
+    lookup = entries.set_index(["tournament_id", "player_id"])["deck_id"].to_dict()
+    records: list[dict[str, Any]] = []
+    for match in scoped.itertuples(index=False):
+        if match.result not in {"A_WIN", "B_WIN", "TIE", "DOUBLE_LOSS"}:
+            continue
+        if not match.player_a or not match.player_b:
+            continue
+        deck_a = lookup.get((match.tournament_id, match.player_a))
+        deck_b = lookup.get((match.tournament_id, match.player_b))
+        if deck_a is None or deck_b is None:
+            continue
+
+        perspectives = []
+        if str(match.player_a) in focus_player_ids:
+            perspectives.append((deck_a, deck_b, True))
+        if str(match.player_b) in focus_player_ids:
+            perspectives.append((deck_b, deck_a, False))
+        for focus_deck, opponent_deck, focus_is_a in perspectives:
+            counts = dict(wins=0, losses=0, ties=0, double_losses=0, all_matches=1)
+            if match.result == "TIE":
+                counts["ties"] = 1
+            elif match.result == "DOUBLE_LOSS":
+                counts["double_losses"] = 1
+            elif (match.result == "A_WIN") == focus_is_a:
+                counts["wins"] = 1
+            else:
+                counts["losses"] = 1
+            records.append({"deck_a": focus_deck, "deck_b": opponent_deck, **counts})
+    return pd.DataFrame(records, columns=columns)
+
+
+def compute_cohort_metrics(
+    tournaments: pd.DataFrame,
+    entries: pd.DataFrame,
+    matches: pd.DataFrame,
+    *,
+    focus_player_ids: Collection[str],
+    match_scope: str = "all",
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Compute usage for a player cohort and results against the complete field.
+
+    Representation, overall records, and Top Cut conversion use the cohort's
+    published standings. Matchup results retain every loaded opponent in events
+    entered by the cohort and are counted only from the cohort perspective.
+    """
+    del tournaments  # Kept in the signature to mirror compute_metrics.
+    selected_ids = {
+        str(player_id).strip()
+        for player_id in focus_player_ids
+        if player_id is not None and str(player_id).strip()
+    }
+    if not selected_ids or entries.empty:
+        return (
+            pd.DataFrame(columns=DECK_SUMMARY_COLUMNS),
+            pd.DataFrame(columns=MATCHUP_COLUMNS),
+        )
+
+    focus_entries = entries[entries["player_id"].astype(str).isin(selected_ids)].copy()
+    if focus_entries.empty:
+        return (
+            pd.DataFrame(columns=DECK_SUMMARY_COLUMNS),
+            pd.DataFrame(columns=MATCHUP_COLUMNS),
+        )
+
+    cohort_tournament_ids = set(focus_entries["tournament_id"])
+    field_entries = entries[entries["tournament_id"].isin(cohort_tournament_ids)].copy()
+    field_matches = (
+        matches[matches["tournament_id"].isin(cohort_tournament_ids)].copy()
+        if "tournament_id" in matches.columns
+        else matches.copy()
+    )
+
+    names = _canonical_names(focus_entries)
+    total_entries = len(focus_entries)
+    base = (
+        focus_entries.groupby("deck_id")
+        .agg(entries=("player_id", "size"), tournament_count=("tournament_id", "nunique"))
+        .reset_index()
+    )
+    base["deck_name"] = base["deck_id"].map(names)
+    base["representation_numerator"] = base["entries"]
+    base["representation_denominator"] = total_entries
+    base["representation"] = base["entries"] / total_entries
+
+    conversion_eligible = focus_entries[focus_entries["top_cut"].notna()]
+    eligible_counts = conversion_eligible.groupby("deck_id").size().to_dict()
+    cut_counts = (
+        conversion_eligible[conversion_eligible["top_cut"].astype(bool)]
+        .groupby("deck_id")
+        .size()
+        .to_dict()
+    )
+    base["conversion_eligible_entries"] = (
+        base["deck_id"].map(eligible_counts).fillna(0).astype(int)
+    )
+    base["top_cut_entries"] = base["deck_id"].map(cut_counts).fillna(0).astype(int)
+    base["top_cut_rate"] = base.apply(
+        lambda row: row["top_cut_entries"] / row["conversion_eligible_entries"]
+        if row["conversion_eligible_entries"]
+        else None,
+        axis=1,
+    )
+
+    directional = _cohort_directional_records(
+        field_entries, field_matches, selected_ids, match_scope
+    )
+    standing_columns = {"wins", "losses", "ties"}
+    if standing_columns.issubset(focus_entries.columns):
+        standing_records = focus_entries[["deck_id", *sorted(standing_columns)]].copy()
+        for column in standing_columns:
+            standing_records[column] = pd.to_numeric(
+                standing_records[column], errors="coerce"
+            ).fillna(0)
+        overall = (
+            standing_records.groupby("deck_id")[["wins", "losses", "ties"]]
+            .sum()
+            .reset_index()
+        )
+    elif directional.empty:
+        overall = pd.DataFrame(columns=["deck_id", "wins", "losses", "ties"])
+    else:
+        overall = (
+            directional.groupby("deck_a")[["wins", "losses", "ties"]]
+            .sum()
+            .reset_index()
+            .rename(columns={"deck_a": "deck_id"})
+        )
+    base = base.merge(overall, how="left", on="deck_id")
+    for column in ("wins", "losses", "ties"):
+        base[column] = base[column].fillna(0).astype(int)
+    base["n_decided"] = base["wins"] + base["losses"]
+    base["overall_raw_win_rate"] = base.apply(
+        lambda row: row["wins"] / row["n_decided"] if row["n_decided"] else None,
+        axis=1,
+    )
+    deck_summary = base[DECK_SUMMARY_COLUMNS].sort_values(
+        ["entries", "deck_name"], ascending=[False, True]
+    ).reset_index(drop=True)
+
+    field_names = _canonical_names(field_entries)
+    field_counts = field_entries.groupby("deck_id").size().to_dict()
+    field_total = len(field_entries)
+    field_conversion = field_entries[field_entries["top_cut"].notna()]
+    field_eligible_counts = field_conversion.groupby("deck_id").size().to_dict()
+    field_cut_counts = (
+        field_conversion[field_conversion["top_cut"].astype(bool)]
+        .groupby("deck_id")
+        .size()
+        .to_dict()
+    )
+
+    if directional.empty:
+        matchup_counts: dict[tuple[str, str], dict[str, int]] = {}
+    else:
+        grouped = (
+            directional.groupby(["deck_a", "deck_b"])[
+                ["wins", "losses", "ties", "double_losses", "all_matches"]
+            ]
+            .sum()
+            .reset_index()
+        )
+        matchup_counts = {
+            (row.deck_a, row.deck_b): {
+                "wins": int(row.wins),
+                "losses": int(row.losses),
+                "ties": int(row.ties),
+                "double_losses": int(row.double_losses),
+                "all_matches": int(row.all_matches),
+            }
+            for row in grouped.itertuples(index=False)
+        }
+
+    matchup_rows: list[dict[str, Any]] = []
+    for deck_a, deck_b in product(deck_summary["deck_id"], field_counts):
+        counts = matchup_counts.get(
+            (deck_a, deck_b),
+            {"wins": 0, "losses": 0, "ties": 0, "double_losses": 0, "all_matches": 0},
+        )
+        n_decided = counts["wins"] + counts["losses"]
+        raw_win_rate = counts["wins"] / n_decided if n_decided else None
+        opponent_representation = field_counts[deck_b] / field_total
+        eligible = int(field_eligible_counts.get(deck_b, 0))
+        cuts = int(field_cut_counts.get(deck_b, 0))
+        matchup_rows.append(
+            {
+                "deck_a": deck_a,
+                "deck_a_name": names[deck_a],
+                "deck_b": deck_b,
+                "deck_b_name": field_names[deck_b],
+                **counts,
+                "n_decided": n_decided,
+                "raw_win_rate": raw_win_rate,
+                "opponent_representation": opponent_representation,
+                "opponent_representation_numerator": int(field_counts[deck_b]),
+                "opponent_representation_denominator": field_total,
+                "weighted_impact": (
+                    opponent_representation * (raw_win_rate - 0.5)
+                    if raw_win_rate is not None
+                    else None
+                ),
+                "opponent_top_cut_entries": cuts,
+                "opponent_conversion_eligible_entries": eligible,
+                "opponent_top_cut_rate": cuts / eligible if eligible else None,
+            }
+        )
+    return deck_summary, pd.DataFrame(matchup_rows, columns=MATCHUP_COLUMNS)
 
 
 def compute_metrics(
@@ -367,6 +600,7 @@ def compute_deck_period_series(
     minimum_players: int,
     match_scope: str,
     bucket_days: int = 7,
+    focus_player_ids: Collection[str] | None = None,
 ) -> pd.DataFrame:
     if bucket_days <= 0:
         raise ValueError("bucket_days must be positive")
@@ -382,17 +616,33 @@ def compute_deck_period_series(
             end_date=bucket_end,
             minimum_players=minimum_players,
         )
-        summary, _ = compute_metrics(
-            period_tournaments,
-            period_entries,
-            period_matches,
-            match_scope=match_scope,
-        )
+        if focus_player_ids is None:
+            analysis_entries = period_entries
+            eligible_tournament_count = len(period_tournaments)
+            summary, _ = compute_metrics(
+                period_tournaments,
+                period_entries,
+                period_matches,
+                match_scope=match_scope,
+            )
+        else:
+            selected_ids = {str(player_id) for player_id in focus_player_ids}
+            analysis_entries = period_entries[
+                period_entries["player_id"].astype(str).isin(selected_ids)
+            ]
+            eligible_tournament_count = analysis_entries["tournament_id"].nunique()
+            summary, _ = compute_cohort_metrics(
+                period_tournaments,
+                period_entries,
+                period_matches,
+                focus_player_ids=selected_ids,
+                match_scope=match_scope,
+            )
         selected = summary[summary["deck_id"] == deck_id]
         if selected.empty:
             values = {
                 "entries": 0,
-                "representation": 0.0 if len(period_entries) else None,
+                "representation": 0.0 if len(analysis_entries) else None,
                 "overall_raw_win_rate": None,
                 "top_cut_rate": None,
                 "wins": 0,
@@ -413,8 +663,8 @@ def compute_deck_period_series(
                 "period_start": bucket_start,
                 "period_end": bucket_end,
                 "period": f"{bucket_start.isoformat()} – {bucket_end.isoformat()}",
-                "eligible_tournaments": len(period_tournaments),
-                "eligible_entries": len(period_entries),
+                "eligible_tournaments": eligible_tournament_count,
+                "eligible_entries": len(analysis_entries),
                 **values,
             }
         )

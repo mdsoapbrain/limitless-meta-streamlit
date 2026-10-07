@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import sys
 from datetime import timedelta
 from pathlib import Path
@@ -18,6 +17,7 @@ if str(SRC_ROOT) not in sys.path:
 
 from limitless_meta.database import read_decklists_for_deck, read_tables  # noqa: E402
 from limitless_meta.metrics import (  # noqa: E402
+    compute_cohort_metrics,
     compute_deck_period_series,
     compute_metrics,
     filter_observed_window,
@@ -28,23 +28,25 @@ from limitless_meta.security import dataframe_to_safe_csv_bytes, escape_markdown
 
 
 DATABASE_PATH = PROJECT_ROOT / "data" / "meta.duckdb"
+VERIFIED_PLAYERS_PATH = PROJECT_ROOT / "data" / "verified_players.csv"
 SUPPORT_URL = "https://buymeacoffee.com/qmi0000011"
 LOW_SAMPLE_N = 20
 LOW_BLUE = "#3f7cac"
 HIGH_RED = "#d26a5c"
 NEUTRAL_GRAY = "#f3f4f6"
-DEBUG_ENABLED = os.getenv("LIMITLESS_ENABLE_DEBUG", "").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-}
+MAX_MATRIX_ARCHETYPES = 25
 
 
-st.set_page_config(page_title="Limitless PTCGL Meta Analyzer", page_icon="⚡", layout="wide")
-st.title("Limitless PTCGL Online Tournament Meta Analyzer")
+st.set_page_config(
+    page_title="PTCGL Standard Meta Analyzer | Decks & Matchups",
+    page_icon="⚡",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+st.title("PTCGL Standard Meta Analyzer")
 st.caption(
-    "Descriptive analysis of the selected observed period. Weighted Impact is matchup "
-    "importance under that observed representation—not a forecast."
+    "Explore online Standard deck usage, win rates, matchups, trends, and public "
+    "decklists from the selected observed period."
 )
 
 
@@ -57,8 +59,6 @@ def load_data(database_mtime: float) -> dict[str, pd.DataFrame]:
             "tournaments",
             "entries",
             "matches",
-            "tournament_audit",
-            "topcut_diagnostics",
             "run_metadata",
         ],
     )
@@ -70,6 +70,30 @@ def load_decklists(
 ) -> pd.DataFrame:
     del database_mtime
     return read_decklists_for_deck(DATABASE_PATH, deck_id, tournament_ids)
+
+
+@st.cache_data(show_spinner=False)
+def load_verified_players(file_mtime: float) -> pd.DataFrame:
+    del file_mtime
+    players = pd.read_csv(VERIFIED_PLAYERS_PATH, dtype=str).fillna("")
+    required = {
+        "real_name",
+        "play_limitless_player_id",
+        "verification_status",
+        "manual_decision",
+        "approval_basis",
+        "source_url",
+    }
+    missing = required - set(players.columns)
+    if missing:
+        raise ValueError(
+            "Verified player roster is missing columns: " + ", ".join(sorted(missing))
+        )
+    return players[
+        players["verification_status"].str.strip().str.upper().eq("YES")
+        & players["manual_decision"].str.strip().str.upper().eq("YES")
+        & players["play_limitless_player_id"].str.strip().ne("")
+    ].sort_values(["real_name", "play_limitless_player_id"]).copy()
 
 
 def representation_chart(summary: pd.DataFrame, limit: int = 15) -> alt.Chart:
@@ -94,41 +118,6 @@ def representation_chart(summary: pd.DataFrame, limit: int = 15) -> alt.Chart:
         text="representation_label:N"
     )
     return (bars + labels).properties(height=max(300, len(source) * 27))
-
-
-def impact_chart(selected_matchups: pd.DataFrame, limit: int = 15) -> alt.Chart:
-    source = selected_matchups.copy()
-    source["absolute_impact"] = source["weighted_impact"].abs()
-    source = source.sort_values("absolute_impact", ascending=False).head(limit)
-    source["impact_pp"] = source["weighted_impact"] * 100
-    source["direction"] = source["impact_pp"].map(
-        lambda value: "Favorable" if value >= 0 else "Unfavorable"
-    )
-    return (
-        alt.Chart(source)
-        .mark_bar()
-        .encode(
-            x=alt.X("impact_pp:Q", title="Weighted Impact (percentage points)"),
-            y=alt.Y("deck_b_name:N", title=None, sort=alt.SortField("absolute_impact", order="descending")),
-            color=alt.Color(
-                "direction:N",
-                title="Observed direction",
-                scale=alt.Scale(
-                    domain=["Unfavorable", "Favorable"], range=[LOW_BLUE, HIGH_RED]
-                ),
-            ),
-            tooltip=[
-                alt.Tooltip("deck_b_name:N", title="Opponent"),
-                alt.Tooltip("wins:Q", title="W"),
-                alt.Tooltip("losses:Q", title="L"),
-                alt.Tooltip("n_decided:Q", title="N"),
-                alt.Tooltip("raw_win_rate:Q", title="Raw WR", format=".1%"),
-                alt.Tooltip("opponent_representation:Q", title="Opponent representation", format=".1%"),
-                alt.Tooltip("impact_pp:Q", title="Weighted Impact (pp)", format="+.2f"),
-            ],
-        )
-        .properties(height=max(280, len(source) * 27))
-    )
 
 
 def trend_chart(source: pd.DataFrame, column: str, title: str) -> alt.Chart:
@@ -205,7 +194,68 @@ st.caption(
     "Source: [Limitless Tournament Platform](https://play.limitlesstcg.com/)"
 )
 
+if not VERIFIED_PLAYERS_PATH.exists():
+    st.error(f"No verified player roster found at {VERIFIED_PLAYERS_PATH}")
+    st.stop()
+verified_players = load_verified_players(VERIFIED_PLAYERS_PATH.stat().st_mtime)
+
 with st.sidebar:
+    st.header("Analysis population")
+    player_scope = st.radio(
+        "Player scope",
+        ["All players", "Approved player group", "Approved player"],
+    )
+    analysis_player_ids: set[str] | None = None
+    scope_label = "All players"
+    scope_slug = "all_players"
+    scope_is_group = False
+    if player_scope != "All players":
+        if verified_players.empty:
+            st.error("The verified player roster does not contain an approved account.")
+            st.stop()
+    if player_scope == "Approved player group":
+        analysis_player_ids = set(
+            verified_players["play_limitless_player_id"].str.strip()
+        )
+        scope_label = f"Approved players ({len(analysis_player_ids)})"
+        scope_slug = "manual_yes_group"
+        scope_is_group = True
+        st.caption(
+            f"{len(analysis_player_ids)} manual-YES players with separately approved "
+            "Play Limitless IDs and entries in this snapshot."
+        )
+    elif player_scope == "Approved player":
+        player_options = {
+            (
+                f"{row.real_name} · {row.play_limitless_player_id}"
+                + (
+                    f" · 2026 WCS #{row.wcs_2026_placing}"
+                    if getattr(row, "wcs_2026_placing", "")
+                    else ""
+                )
+            ): row.Index
+            for row in verified_players.itertuples()
+        }
+        player_label = st.selectbox("Player", list(player_options))
+        selected_player = verified_players.loc[player_options[player_label]]
+        player_id = selected_player["play_limitless_player_id"].strip()
+        scope_label = selected_player["real_name"].strip()
+        scope_slug = player_id
+        analysis_player_ids = {player_id}
+        st.caption(f"Verified Play Limitless ID: {player_id}")
+        if selected_player["source_url"].strip():
+            st.link_button(
+                "Identity verification source",
+                selected_player["source_url"].strip(),
+                width="stretch",
+            )
+        if selected_player.get("social_profile_url", "").strip():
+            st.link_button(
+                "Public social profile",
+                selected_player["social_profile_url"].strip(),
+                width="stretch",
+            )
+    st.divider()
     st.header("Observed window")
     preset = st.selectbox(
         "Time window", ["Custom", "Last 7 days", "Last 14 days", "Last 30 days", "Last 60 days"]
@@ -227,15 +277,20 @@ with st.sidebar:
     )
     match_scope_label = st.selectbox("Match scope", ["All", "Swiss only"])
     match_scope = "all" if match_scope_label == "All" else "swiss"
-    minimum_n = st.number_input("Minimum matchup N", min_value=0, value=10, step=1)
+    minimum_n = st.number_input(
+        "Minimum matchup N",
+        min_value=0,
+        value=3 if analysis_player_ids else 10,
+        step=1,
+        key=f"minimum_matchup_n_{scope_slug}",
+    )
     hide_unknown = st.checkbox("Hide UNKNOWN decks", value=True)
-    debug_mode = st.checkbox("Debug mode", value=False) if DEBUG_ENABLED else False
 
 if selected_start > selected_end:
     st.error("Start date must be on or before end date.")
     st.stop()
 
-filtered_tournaments, filtered_entries, filtered_matches = filter_observed_window(
+observed_tournaments, observed_entries, observed_matches = filter_observed_window(
     tournaments,
     entries,
     matches,
@@ -243,25 +298,72 @@ filtered_tournaments, filtered_entries, filtered_matches = filter_observed_windo
     end_date=selected_end,
     minimum_players=minimum_players,
 )
-included_ids = set(filtered_tournaments["tournament_id"])
-deck_summary, matchups = compute_metrics(
-    filtered_tournaments, filtered_entries, filtered_matches, match_scope=match_scope
-)
+
+if analysis_player_ids:
+    filtered_entries = observed_entries[
+        observed_entries["player_id"].astype(str).isin(analysis_player_ids)
+    ].copy()
+    included_ids = set(filtered_entries["tournament_id"])
+    filtered_tournaments = observed_tournaments[
+        observed_tournaments["tournament_id"].isin(included_ids)
+    ].copy()
+    field_entries = observed_entries[observed_entries["tournament_id"].isin(included_ids)].copy()
+    field_matches = observed_matches[observed_matches["tournament_id"].isin(included_ids)].copy()
+    filtered_matches = field_matches
+    deck_summary, matchups = compute_cohort_metrics(
+        filtered_tournaments,
+        field_entries,
+        field_matches,
+        focus_player_ids=analysis_player_ids,
+        match_scope=match_scope,
+    )
+    field_deck_summary, _ = compute_metrics(
+        filtered_tournaments, field_entries, field_matches, match_scope=match_scope
+    )
+else:
+    filtered_tournaments = observed_tournaments
+    filtered_entries = observed_entries
+    filtered_matches = observed_matches
+    field_entries = filtered_entries
+    field_matches = filtered_matches
+    included_ids = set(filtered_tournaments["tournament_id"])
+    deck_summary, matchups = compute_metrics(
+        filtered_tournaments, filtered_entries, filtered_matches, match_scope=match_scope
+    )
+    field_deck_summary = deck_summary
 
 if deck_summary.empty:
-    st.warning("No entries match these filters. Broaden the window or lower the player threshold.")
+    st.warning(
+        f"No entries for {scope_label} match these filters. "
+        "Broaden the window or lower the player threshold."
+    )
     st.stop()
+
+if analysis_player_ids:
+    population_label = "Cohort" if scope_is_group else "Player"
+    st.info(
+        f"{population_label} view: {scope_label}. Deck usage and overall records use the "
+        "selected population's "
+        "published standings; matchup views retain every loaded opponent and count pairings "
+        "from the selected population's perspective."
+    )
 
 selector_summary = deck_summary
 if hide_unknown:
     selector_summary = selector_summary[selector_summary["deck_id"] != UNKNOWN_DECK_ID]
-label_to_id = {
-    f"{row.deck_name} · {row.deck_id}": row.deck_id
+selector_summary = selector_summary.sort_values(
+    ["entries", "deck_name"], ascending=[False, True]
+)
+deck_options = selector_summary["deck_id"].tolist()
+deck_labels = {
+    row.deck_id: f"{row.deck_name} · {row.entries:,} entries"
     for row in selector_summary.sort_values(["entries", "deck_name"], ascending=[False, True]).itertuples()
 }
+if not deck_options:
+    st.warning("No visible deck remains after the current filters.")
+    st.stop()
+
 with st.sidebar:
-    st.divider()
-    selected_label = st.selectbox("Deck", list(label_to_id))
     st.markdown(
         f"""
         <a class="bmc-sidebar-link" href="{SUPPORT_URL}" target="_blank"
@@ -303,45 +405,86 @@ with st.sidebar:
         """,
         unsafe_allow_html=True,
     )
-selected_id = label_to_id[selected_label]
-selected = deck_summary[deck_summary["deck_id"] == selected_id].iloc[0]
 
 tabs = st.tabs(
     [
-        "Overview",
-        "Selected deck",
-        "Matchup heatmap",
-        "Period comparison",
-        "Tournament drill-down",
-        "Tournament audit",
-        "Top Cut diagnostics",
+        "Meta overview",
+        "Deck explorer",
+        "Matchup matrix",
+        "Period change",
     ]
 )
 
 with tabs[0]:
     overview_metrics = st.columns(3)
-    overview_metrics[0].metric("Eligible tournaments", f"{len(filtered_tournaments):,}")
-    overview_metrics[1].metric("Eligible entries", f"{len(filtered_entries):,}")
-    overview_metrics[2].metric("Archetypes", f"{len(deck_summary):,}")
+    overview_metrics[0].metric(
+        "Tournaments entered" if analysis_player_ids else "Eligible tournaments",
+        f"{len(filtered_tournaments):,}",
+    )
+    overview_metrics[1].metric(
+        (
+            "Cohort entries"
+            if scope_is_group
+            else "Player entries" if analysis_player_ids else "Eligible entries"
+        ),
+        f"{len(filtered_entries):,}",
+    )
+    overview_metrics[2].metric(
+        "Archetypes used" if analysis_player_ids else "Archetypes",
+        f"{len(deck_summary):,}",
+    )
 
     chart_summary = deck_summary
     if hide_unknown:
         chart_summary = chart_summary[chart_summary["deck_id"] != UNKNOWN_DECK_ID]
-    st.subheader("Observed representation")
+    st.subheader("Deck choice share" if analysis_player_ids else "Observed representation")
     st.altair_chart(representation_chart(chart_summary), width="stretch")
-    st.caption("Top 15 archetypes by tournament-entry representation; UNKNOWN remains in the denominator.")
+    if analysis_player_ids:
+        st.caption(
+            "Share of the selected population's tournament entries using each archetype; "
+            "UNKNOWN remains in the denominator."
+        )
+    else:
+        st.caption(
+            "Top 15 archetypes by tournament-entry representation; "
+            "UNKNOWN remains in the denominator."
+        )
 
-    global_table = chart_summary[
-        [
-            "deck_name", "deck_id", "entries", "representation", "wins", "losses",
-            "n_decided", "overall_raw_win_rate", "top_cut_entries",
-            "conversion_eligible_entries", "top_cut_rate",
+    table_source = chart_summary.copy()
+    table_columns = [
+        "deck_name", "deck_id", "entries", "representation", "wins", "losses",
+        "n_decided", "overall_raw_win_rate", "top_cut_entries",
+        "conversion_eligible_entries", "top_cut_rate",
+    ]
+    if analysis_player_ids:
+        field_lookup = field_deck_summary.set_index("deck_id")
+        table_source["field_representation"] = table_source["deck_id"].map(
+            field_lookup["representation"]
+        )
+        table_source["representation_delta_pp"] = (
+            table_source["representation"] - table_source["field_representation"]
+        ) * 100
+        table_source["field_raw_win_rate"] = table_source["deck_id"].map(
+            field_lookup["overall_raw_win_rate"]
+        )
+        table_source["raw_wr_delta_pp"] = (
+            table_source["overall_raw_win_rate"] - table_source["field_raw_win_rate"]
+        ) * 100
+        table_columns = [
+            "deck_name", "deck_id", "entries", "representation", "field_representation",
+            "representation_delta_pp", "wins", "losses", "n_decided",
+            "overall_raw_win_rate", "field_raw_win_rate", "raw_wr_delta_pp",
+            "top_cut_entries", "conversion_eligible_entries", "top_cut_rate",
         ]
-    ].rename(
+    global_table = table_source[table_columns].rename(
         columns={
             "deck_name": "Deck", "deck_id": "Deck ID", "entries": "Entries",
             "representation": "Representation", "wins": "W", "losses": "L",
             "n_decided": "N", "overall_raw_win_rate": "Overall WR",
+            "field_representation": "Field representation",
+            "representation_delta_pp": "Usage Δ (pp)",
+            "field_raw_win_rate": "Field WR",
+            "raw_wr_delta_pp": "WR Δ (pp)",
             "top_cut_entries": "Top Cuts",
             "conversion_eligible_entries": "Conversion Eligible",
             "top_cut_rate": "Top Cut Rate",
@@ -353,220 +496,282 @@ with tabs[0]:
         hide_index=True,
         column_config={
             "Representation": st.column_config.NumberColumn(format="percent"),
+            "Field representation": st.column_config.NumberColumn(format="percent"),
+            "Usage Δ (pp)": st.column_config.NumberColumn(format="%+.2f pp"),
             "Overall WR": st.column_config.NumberColumn(format="percent"),
+            "Field WR": st.column_config.NumberColumn(format="percent"),
+            "WR Δ (pp)": st.column_config.NumberColumn(format="%+.2f pp"),
             "Top Cut Rate": st.column_config.NumberColumn(format="percent"),
         },
     )
+    if analysis_player_ids:
+        st.caption(
+            "Selected-population WR uses published standings. Field WR and matchup "
+            "breakdowns use "
+            "the loaded pairing records."
+        )
     st.download_button(
-        "Export global summary",
+        "Export summary",
         dataframe_to_safe_csv_bytes(global_table),
-        file_name="deck_summary_filtered.csv",
+        file_name=f"{scope_slug}_deck_summary.csv",
         mime="text/csv",
     )
 
 with tabs[1]:
-    metric_columns = st.columns(4)
+    st.subheader("Deck explorer")
+    selection_column, context_column = st.columns([3, 2], vertical_alignment="bottom")
+    deck_state_key = f"selected_deck_id_{scope_slug}"
+    if st.session_state.get(deck_state_key) not in deck_options:
+        st.session_state[deck_state_key] = deck_options[0]
+    with selection_column:
+        selected_id = st.selectbox(
+            "Select deck",
+            deck_options,
+            format_func=lambda deck_id: deck_labels[deck_id],
+            key=deck_state_key,
+        )
+    with context_column:
+        st.caption(
+            "Your deck selection stays fixed while you adjust matchup filters or open "
+            "other sections."
+        )
+    selected = deck_summary[deck_summary["deck_id"] == selected_id].iloc[0]
+
+    conversion_rate = (
+        f"{selected.top_cut_rate:.1%}" if pd.notna(selected.top_cut_rate) else "NA"
+    )
+    conversion_detail = (
+        f"{selected.top_cut_entries:,}/{selected.conversion_eligible_entries:,} eligible entries"
+        if pd.notna(selected.top_cut_rate)
+        else "not available"
+    )
+    metric_columns = st.columns(3)
     metric_columns[0].metric("Representation", f"{selected.representation:.1%}")
     metric_columns[1].metric(
         "Overall raw WR",
-        f"{selected.overall_raw_win_rate:.1%}" if pd.notna(selected.overall_raw_win_rate) else "NA",
+        (
+            f"{selected.overall_raw_win_rate:.1%}"
+            if pd.notna(selected.overall_raw_win_rate)
+            else "NA"
+        ),
         help="Wins / (wins + losses); ties and byes excluded.",
     )
-    metric_columns[2].metric("Entries", f"{selected.entries:,}")
-    metric_columns[3].metric("Tournaments represented", f"{selected.tournament_count:,}")
-    conversion = (
-        f"{selected.top_cut_entries}/{selected.conversion_eligible_entries} "
-        f"({selected.top_cut_rate:.2%})"
-        if pd.notna(selected.top_cut_rate)
-        else "NA"
-    )
-    st.markdown(f"**Top Cut / Conversion:** {conversion}")
+    metric_columns[2].metric("Top Cut conversion", conversion_rate)
     st.caption(
-        f"Overall decided record: {selected.wins:,}-{selected.losses:,}. "
-        f"Internally retained ties: {selected.ties:,}."
-    )
-
-    st.subheader("Representative decklists")
-    selected_decklists = load_decklists(
-        DATABASE_PATH.stat().st_mtime,
-        selected_id,
-        tuple(sorted(included_ids)),
-    )
-    representative_lists = select_representative_decklists(
-        filtered_tournaments,
-        filtered_entries,
-        selected_decklists,
-        deck_id=selected_id,
-        limit=3,
-    )
-    st.caption(
-        "One best-finishing list per tournament, ranked by tournament size; "
-        "up to three tournaments in the current observed window."
-    )
-    if representative_lists.empty:
-        st.info("No published decklist is available for this deck in the current window.")
-    else:
-        list_tabs = st.tabs(
-            [
-                (
-                    f"{index + 1} · {int(row.players):,} players · "
-                    f"#{int(row.placing)}" if pd.notna(row.placing)
-                    else f"{index + 1} · {int(row.players):,} players · unplaced"
-                )
-                for index, row in enumerate(representative_lists.itertuples(index=False))
-            ]
+        f"Record: {selected.wins:,} W · {selected.losses:,} L · {selected.ties:,} T · "
+        f"Top Cut: {conversion_detail} · Observed in "
+        f"{selected.tournament_count:,} tournament(s). "
+        + (
+            "Representation is this deck's share of the selected population's entries."
+            if analysis_player_ids
+            else "All figures follow the filters in the sidebar."
         )
-        for list_tab, row in zip(
-            list_tabs, representative_lists.itertuples(index=False), strict=True
-        ):
-            with list_tab:
-                detail_column, link_column = st.columns([4, 2])
-                with detail_column:
-                    st.markdown(f"**{escape_markdown(row.tournament_name)}**")
-                    placing = f"#{int(row.placing)}" if pd.notna(row.placing) else "Unplaced"
-                    st.caption(
-                        escape_markdown(
-                            f"{row.tournament_date} · {int(row.players):,} players · "
-                            f"{row.player_name} · {placing} · "
-                            f"{int(row.wins)}-{int(row.losses)}-{int(row.ties)}"
-                        )
-                    )
-                with link_column:
-                    st.link_button(
-                        "Open on Limitless",
-                        "https://play.limitlesstcg.com/tournament/"
-                        f"{row.tournament_id}/player/{row.player_id}/decklist",
-                        width="stretch",
-                    )
-                card_sections = decklist_cards(row.decklist_json)
-                section_columns = st.columns(3)
-                for section_column, (section_name, card_frame) in zip(
-                    section_columns, card_sections.items(), strict=True
-                ):
-                    with section_column:
-                        total_cards = int(card_frame["Qty"].sum()) if not card_frame.empty else 0
-                        st.markdown(f"**{section_name} ({total_cards})**")
-                        st.dataframe(card_frame, width="stretch", hide_index=True)
+    )
 
     selected_matchups = matchups[
         (matchups["deck_a"] == selected_id) & (matchups["n_decided"] >= minimum_n)
     ].copy()
     if hide_unknown:
-        selected_matchups = selected_matchups[selected_matchups["deck_b"] != UNKNOWN_DECK_ID]
+        selected_matchups = selected_matchups[
+            selected_matchups["deck_b"] != UNKNOWN_DECK_ID
+        ]
 
-    st.subheader("Observed matchup impact")
-    if selected_matchups.empty:
-        st.info("No matchups meet the current minimum N.")
-    else:
-        st.altair_chart(impact_chart(selected_matchups), width="stretch")
+    with st.container(border=True):
+        st.subheader("Matchup record")
         st.caption(
-            "Positive and negative bars show representation-weighted deviation from 50%; "
-            "they do not predict a future win rate."
+            "Results are sorted by decided sample size. Click any table header to sort "
+            "interactively."
         )
+        if selected_matchups.empty:
+            st.info("No matchups meet the current minimum N.")
+        else:
+            selected_matchups = selected_matchups.sort_values(
+                ["n_decided", "raw_win_rate", "deck_b_name"],
+                ascending=[False, False, True],
+                na_position="last",
+            )
+            low_sample_count = int(
+                (selected_matchups["n_decided"] < LOW_SAMPLE_N).sum()
+            )
+            if low_sample_count:
+                st.warning(
+                    f"{low_sample_count} displayed matchup(s) have fewer than "
+                    f"{LOW_SAMPLE_N} decided games."
+                )
+            selected_matchups["tie_rate"] = selected_matchups["ties"].div(
+                selected_matchups["all_matches"].where(
+                    selected_matchups["all_matches"] > 0
+                )
+            )
+            table = pd.DataFrame(
+                {
+                    "Opponent": selected_matchups["deck_b_name"],
+                    "Opponent share": selected_matchups["opponent_representation"],
+                    "Matches": selected_matchups["all_matches"],
+                    "W": selected_matchups["wins"],
+                    "L": selected_matchups["losses"],
+                    "T": selected_matchups["ties"],
+                    "Raw matchup WR": selected_matchups["raw_win_rate"],
+                    "Tie rate": selected_matchups["tie_rate"],
+                    "Top Cut conversion": selected_matchups.apply(
+                        lambda row: (
+                            f"{row.opponent_top_cut_entries}/"
+                            f"{row.opponent_conversion_eligible_entries} "
+                            f"({row.opponent_top_cut_rate:.1%})"
+                            if pd.notna(row.opponent_top_cut_rate)
+                            else "NA"
+                        ),
+                        axis=1,
+                    ),
+                }
+            )
+            st.dataframe(
+                table,
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "Opponent share": st.column_config.NumberColumn(format="percent"),
+                    "Raw matchup WR": st.column_config.NumberColumn(format="percent"),
+                    "Tie rate": st.column_config.NumberColumn(format="percent"),
+                },
+            )
+            st.download_button(
+                "Export matchup table",
+                dataframe_to_safe_csv_bytes(table),
+                file_name=f"{selected_id}_matchups.csv",
+                mime="text/csv",
+            )
 
-    st.subheader("Observed weekly trend")
-    trend = compute_deck_period_series(
-        tournaments,
-        entries,
-        matches,
-        deck_id=selected_id,
-        start_date=selected_start,
-        end_date=selected_end,
-        minimum_players=minimum_players,
-        match_scope=match_scope,
-    )
-    trend_columns = st.columns(3)
-    trend_columns[0].altair_chart(
-        trend_chart(trend, "representation", "Representation"), width="stretch"
-    )
-    trend_columns[1].altair_chart(
-        trend_chart(trend, "overall_raw_win_rate", "Overall raw WR"), width="stretch"
-    )
-    if trend["top_cut_rate"].notna().any():
-        trend_columns[2].altair_chart(
-            trend_chart(trend, "top_cut_rate", "Top Cut rate"), width="stretch"
+    with st.container(border=True):
+        st.subheader("Weekly trend")
+        trend = compute_deck_period_series(
+            tournaments,
+            entries,
+            matches,
+            deck_id=selected_id,
+            start_date=selected_start,
+            end_date=selected_end,
+            minimum_players=minimum_players,
+            match_scope=match_scope,
+            focus_player_ids=analysis_player_ids,
         )
-    else:
-        trend_columns[2].info("No conversion-eligible event in these weekly buckets.")
-
-    sort_label = st.selectbox(
-        "Sort matchup table by",
-        [
-            "Absolute Weighted Impact", "Representation", "Raw Matchup WR", "N",
-            "Weighted Impact", "Top Cut Rate", "Conversion count",
-        ],
-    )
-    sort_map = {
-        "Representation": ("opponent_representation", False),
-        "Raw Matchup WR": ("raw_win_rate", False),
-        "N": ("n_decided", False),
-        "Weighted Impact": ("weighted_impact", False),
-        "Top Cut Rate": ("opponent_top_cut_rate", False),
-        "Conversion count": ("opponent_top_cut_entries", False),
-    }
-    if sort_label == "Absolute Weighted Impact":
-        selected_matchups["_sort"] = selected_matchups["weighted_impact"].abs()
-        selected_matchups = selected_matchups.sort_values("_sort", ascending=False)
-    else:
-        column, ascending = sort_map[sort_label]
-        selected_matchups = selected_matchups.sort_values(column, ascending=ascending, na_position="last")
-
-    low_sample_count = int((selected_matchups["n_decided"] < LOW_SAMPLE_N).sum())
-    if low_sample_count:
-        st.warning(
-            f"{low_sample_count} displayed matchup(s) have N < {LOW_SAMPLE_N}. "
-            "Their raw rates are retained but should be read cautiously."
+        trend_columns = st.columns(3)
+        trend_columns[0].altair_chart(
+            trend_chart(trend, "representation", "Representation"), width="stretch"
         )
-    table = pd.DataFrame(
-        {
-            "Opponent": selected_matchups["deck_b_name"],
-            "Representation": selected_matchups["opponent_representation"],
-            "W": selected_matchups["wins"],
-            "L": selected_matchups["losses"],
-            "N": selected_matchups["n_decided"],
-            "Sample": selected_matchups["n_decided"].map(
-                lambda value: f"Low N (<{LOW_SAMPLE_N})" if value < LOW_SAMPLE_N else ""
-            ),
-            "Raw Matchup WR": selected_matchups["raw_win_rate"],
-            "Weighted Impact (pp)": selected_matchups["weighted_impact"] * 100,
-            "Top Cut Rate / Conversion": selected_matchups.apply(
-                lambda row: (
-                    f"{row.opponent_top_cut_entries}/{row.opponent_conversion_eligible_entries} "
-                    f"({row.opponent_top_cut_rate:.2%})"
-                    if pd.notna(row.opponent_top_cut_rate)
-                    else "NA"
-                ),
-                axis=1,
-            ),
-        }
-    )
-    st.dataframe(
-        table,
-        width="stretch",
-        hide_index=True,
-        column_config={
-            "Representation": st.column_config.NumberColumn(format="percent"),
-            "Raw Matchup WR": st.column_config.NumberColumn(format="percent"),
-            "Weighted Impact (pp)": st.column_config.NumberColumn(format="%+.2f pp"),
-        },
-    )
-    st.download_button(
-        "Export selected matchups",
-        dataframe_to_safe_csv_bytes(table),
-        file_name=f"{selected_id}_matchups.csv",
-        mime="text/csv",
-    )
+        trend_columns[1].altair_chart(
+            trend_chart(trend, "overall_raw_win_rate", "Overall raw WR"),
+            width="stretch",
+        )
+        if trend["top_cut_rate"].notna().any():
+            trend_columns[2].altair_chart(
+                trend_chart(trend, "top_cut_rate", "Top Cut rate"), width="stretch"
+            )
+        else:
+            trend_columns[2].info(
+                "No conversion-eligible event in these weekly buckets."
+            )
+
+    with st.container(border=True):
+        st.subheader("Representative decklists")
+        selected_decklists = load_decklists(
+            DATABASE_PATH.stat().st_mtime,
+            selected_id,
+            tuple(sorted(included_ids)),
+        )
+        representative_lists = select_representative_decklists(
+            filtered_tournaments,
+            filtered_entries,
+            selected_decklists,
+            deck_id=selected_id,
+            limit=3,
+        )
+        st.caption(
+            (
+                "The selected population's best finish with this deck in each "
+                "tournament; "
+                if analysis_player_ids
+                else "One best-finishing list per tournament; "
+            )
+            + "ranked by tournament size, up to three tournaments in the current window."
+        )
+        if representative_lists.empty:
+            st.info(
+                "No published decklist is available for this deck in the current window."
+            )
+        else:
+            for index, row in enumerate(
+                representative_lists.itertuples(index=False)
+            ):
+                placing = (
+                    f"#{int(row.placing)}" if pd.notna(row.placing) else "Unplaced"
+                )
+                expander_title = (
+                    f"{index + 1}. {escape_markdown(str(row.tournament_name))} · "
+                    f"{int(row.players):,} players · {placing}"
+                )
+                with st.expander(expander_title, expanded=index == 0):
+                    detail_column, link_column = st.columns([4, 2])
+                    with detail_column:
+                        st.caption(
+                            escape_markdown(
+                                f"{row.tournament_date} · {row.player_name} · "
+                                f"{int(row.wins)}-{int(row.losses)}-{int(row.ties)}"
+                            )
+                        )
+                    with link_column:
+                        st.link_button(
+                            "Open on Limitless",
+                            "https://play.limitlesstcg.com/tournament/"
+                            f"{row.tournament_id}/player/{row.player_id}/decklist",
+                            width="stretch",
+                        )
+                    card_sections = decklist_cards(row.decklist_json)
+                    section_columns = st.columns(3)
+                    for section_column, (section_name, card_frame) in zip(
+                        section_columns, card_sections.items(), strict=True
+                    ):
+                        with section_column:
+                            total_cards = (
+                                int(card_frame["Qty"].sum())
+                                if not card_frame.empty
+                                else 0
+                            )
+                            st.markdown(f"**{section_name} ({total_cards})**")
+                            st.dataframe(
+                                card_frame, width="stretch", hide_index=True
+                            )
 
 with tabs[2]:
-    matrix_size = st.slider("Archetypes in matrix", min_value=5, max_value=25, value=15)
+    st.subheader("Matchup matrix")
+    st.caption(
+        f"Automatically shows up to the top {MAX_MATRIX_ARCHETYPES} archetypes by "
+        "representation. Use Minimum matchup N in the sidebar to control reliability."
+    )
     matrix_summary = deck_summary
     if hide_unknown:
         matrix_summary = matrix_summary[matrix_summary["deck_id"] != UNKNOWN_DECK_ID]
+    matrix_size = min(MAX_MATRIX_ARCHETYPES, len(matrix_summary))
     matrix_ids = matrix_summary.head(matrix_size)["deck_id"].tolist()
     matrix_names = matrix_summary.head(matrix_size)["deck_name"].tolist()
+    if analysis_player_ids:
+        opponent_summary = (
+            matchups[
+                ["deck_b", "deck_b_name", "opponent_representation"]
+            ]
+            .drop_duplicates("deck_b")
+            .sort_values(["opponent_representation", "deck_b_name"], ascending=[False, True])
+        )
+        if hide_unknown:
+            opponent_summary = opponent_summary[opponent_summary["deck_b"] != UNKNOWN_DECK_ID]
+        opponent_ids = opponent_summary.head(matrix_size)["deck_b"].tolist()
+        opponent_names = opponent_summary.head(matrix_size)["deck_b_name"].tolist()
+    else:
+        opponent_ids = matrix_ids
+        opponent_names = matrix_names
     matrix = matchups[
         matchups["deck_a"].isin(matrix_ids)
-        & matchups["deck_b"].isin(matrix_ids)
+        & matchups["deck_b"].isin(opponent_ids)
         & (matchups["n_decided"] >= minimum_n)
         & matchups["raw_win_rate"].notna()
     ].copy()
@@ -577,7 +782,7 @@ with tabs[2]:
             alt.Chart(matrix)
             .mark_rect()
             .encode(
-                x=alt.X("deck_b_name:N", title="Opponent", sort=matrix_names),
+                x=alt.X("deck_b_name:N", title="Opponent", sort=opponent_names),
                 y=alt.Y("deck_a_name:N", title="Selected deck", sort=matrix_names),
                 color=alt.Color(
                     "raw_win_rate:Q",
@@ -596,10 +801,9 @@ with tabs[2]:
                     alt.Tooltip("losses:Q", title="L"),
                     alt.Tooltip("n_decided:Q", title="N"),
                     alt.Tooltip("raw_win_rate:Q", title="Raw WR", format=".1%"),
-                    alt.Tooltip("weighted_impact:Q", title="Weighted Impact", format="+.2%"),
                 ],
             )
-            .properties(height=max(430, matrix_size * 28))
+            .properties(height=max(430, len(matrix_ids) * 28))
         )
         st.altair_chart(heatmap, width="stretch")
         st.caption(
@@ -623,15 +827,30 @@ with tabs[3]:
         end_date=previous_end,
         minimum_players=minimum_players,
     )
-    if previous_tournaments.empty:
-        st.info(
-            "The database does not contain eligible tournaments for the previous equal-length "
-            "window. Run analysis with an earlier start date to enable this comparison."
+    if analysis_player_ids:
+        previous_focus_entries = previous_entries[
+            previous_entries["player_id"].astype(str).isin(analysis_player_ids)
+        ]
+        previous_has_data = not previous_focus_entries.empty
+        previous_summary, _ = compute_cohort_metrics(
+            previous_tournaments,
+            previous_entries,
+            previous_matches,
+            focus_player_ids=analysis_player_ids,
+            match_scope=match_scope,
         )
     else:
+        previous_has_data = not previous_tournaments.empty
         previous_summary, _ = compute_metrics(
             previous_tournaments, previous_entries, previous_matches, match_scope=match_scope
         )
+    if not previous_has_data:
+        st.info(
+            (f"{scope_label} has no eligible entry" if analysis_player_ids else
+             "The database contains no eligible tournament")
+            + " in the previous equal-length window."
+        )
+    else:
         comparison = deck_summary.merge(
             previous_summary,
             on="deck_id",
@@ -727,97 +946,6 @@ with tabs[3]:
                 "Current Top Cut rate": st.column_config.NumberColumn(format="percent"),
             },
         )
-
-with tabs[4]:
-    event_options = {
-        f"{row.date} · {row.name} · {row.players} players": row.tournament_id
-        for row in filtered_tournaments.sort_values(["date", "players"], ascending=[False, False]).itertuples()
-    }
-    event_label = st.selectbox("Tournament", list(event_options))
-    event_id = event_options[event_label]
-    event = filtered_tournaments[filtered_tournaments["tournament_id"] == event_id].iloc[0]
-    event_entries = filtered_entries[filtered_entries["tournament_id"] == event_id].copy()
-    event_matches = filtered_matches[filtered_matches["tournament_id"] == event_id].copy()
-    event_summary, _ = compute_metrics(
-        filtered_tournaments[filtered_tournaments["tournament_id"] == event_id],
-        event_entries,
-        event_matches,
-        match_scope=match_scope,
-    )
-    valid_event_matches = event_matches[
-        event_matches["result"].isin(["A_WIN", "B_WIN"])
-        & event_matches["player_a"].notna()
-        & event_matches["player_b"].notna()
-    ]
-    event_metrics = st.columns(4)
-    event_metrics[0].metric("Players", f"{event.players:,}")
-    event_metrics[1].metric("Loaded entries", f"{len(event_entries):,}")
-    event_metrics[2].metric("Decided matches", f"{len(valid_event_matches):,}")
-    event_metrics[3].metric(
-        "Top Cut", f"{int(event.top_cut_size)}" if pd.notna(event.top_cut_size) else "NA"
-    )
-    completion = getattr(event, "is_complete", None)
-    if completion is not None and not bool(completion):
-        st.warning("This tournament appears incomplete; its cache will be refreshed after the configured TTL.")
-
-    event_visual = event_summary
-    if hide_unknown:
-        event_visual = event_visual[event_visual["deck_id"] != UNKNOWN_DECK_ID]
-    st.altair_chart(representation_chart(event_visual, limit=12), width="stretch")
-
-    cut_entries = event_entries[event_entries["top_cut"].fillna(False).astype(bool)][
-        ["placing", "player_id", "deck_name", "deck_id", "wins", "losses", "ties"]
-    ].sort_values("placing")
-    st.subheader("Top Cut entrants")
-    if cut_entries.empty:
-        st.info("No explicit Top Cut was detected for this tournament.")
-    else:
-        st.dataframe(cut_entries, width="stretch", hide_index=True)
-
-    deck_lookup = event_entries.set_index("player_id")[["deck_name", "deck_id"]]
-    match_detail = event_matches.copy()
-    match_detail["deck_a"] = match_detail["player_a"].map(deck_lookup["deck_name"])
-    match_detail["deck_b"] = match_detail["player_b"].map(deck_lookup["deck_name"])
-    match_columns = [
-        "phase_type", "round", "table_or_match", "player_a", "deck_a",
-        "player_b", "deck_b", "winner", "result",
-    ]
-    st.subheader("Pairing audit")
-    st.dataframe(match_detail[match_columns], width="stretch", hide_index=True)
-    st.download_button(
-        "Export tournament pairings",
-        dataframe_to_safe_csv_bytes(match_detail[match_columns]),
-        file_name=f"{event_id}_pairings.csv",
-        mime="text/csv",
-    )
-
-with tabs[5]:
-    audit = data["tournament_audit"].copy()
-    audit["date"] = pd.to_datetime(audit["date"]).dt.date
-    visible_audit = audit[(audit["date"] >= selected_start) & (audit["date"] <= selected_end)]
-    if not debug_mode:
-        visible_audit = visible_audit[visible_audit["included"].fillna(False)]
-    audit_columns = [
-        "name", "date", "players", "organizer", "format", "platform", "included",
-        "exclusion_reason", "is_complete", "top_cut_detected", "top_cut_size",
-    ]
-    audit_columns = [column for column in audit_columns if column in visible_audit.columns]
-    st.dataframe(visible_audit[audit_columns], width="stretch", hide_index=True)
-    st.download_button(
-        "Export tournament audit",
-        dataframe_to_safe_csv_bytes(visible_audit),
-        file_name="tournament_audit_filtered.csv",
-        mime="text/csv",
-    )
-
-with tabs[6]:
-    diagnostics = data["topcut_diagnostics"]
-    diagnostics = diagnostics[diagnostics["tournament_id"].isin(included_ids)]
-    st.dataframe(diagnostics, width="stretch", hide_index=True)
-    suspicious_count = (
-        int(diagnostics["suspicious"].fillna(False).sum()) if not diagnostics.empty else 0
-    )
-    st.caption(f"Suspicious Top Cut detections requiring manual inspection: {suspicious_count}")
 
 st.divider()
 st.caption(
