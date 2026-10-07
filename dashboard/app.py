@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import json
 import sys
 from datetime import timedelta
@@ -16,15 +17,21 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from limitless_meta.database import read_decklists_for_deck, read_tables  # noqa: E402
-from limitless_meta.metrics import (  # noqa: E402
-    compute_cohort_metrics,
-    compute_deck_period_series,
-    compute_metrics,
-    filter_observed_window,
-    select_representative_decklists,
-)
+from limitless_meta import metrics as metrics_module  # noqa: E402
 from limitless_meta.models import UNKNOWN_DECK_ID  # noqa: E402
 from limitless_meta.security import dataframe_to_safe_csv_bytes, escape_markdown  # noqa: E402
+
+
+# A Streamlit Cloud hot deploy can rerun this script before unloading an older
+# local module. Reload only when the newly added cohort API is not yet present.
+if not hasattr(metrics_module, "compute_cohort_metrics"):
+    metrics_module = importlib.reload(metrics_module)
+
+compute_cohort_metrics = metrics_module.compute_cohort_metrics
+compute_deck_period_series = metrics_module.compute_deck_period_series
+compute_metrics = metrics_module.compute_metrics
+filter_observed_window = metrics_module.filter_observed_window
+select_representative_decklists = metrics_module.select_representative_decklists
 
 
 DATABASE_PATH = PROJECT_ROOT / "data" / "meta.duckdb"
